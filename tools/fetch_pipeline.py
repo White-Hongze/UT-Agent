@@ -46,7 +46,7 @@ ERROR_PATTERNS = [
     r"\[?\s*failed\s*\]?",                 # [FAILED] / FAILED / Failed 等
     r"\[?\s*fatal\s*\]?",                  # [FATAL] / FATAL / Fatal 等
     r"failed.*test.*failed",               # CTest summary: N tests failed
-    r"(?-i:(?:ERROR|Error)\s*:)",          # Error: / ERROR:（豁免纯小写 error:）
+    r"\berror\s*:",                        # error: / Error: / ERROR:（含 gcc/clang 小写 error:）
     r"undefined reference",                # 链接错误
     r"fatal\s+error",                      # fatal error（编译致命错误）
     r"❌.*test.*fail",                     # 自定义脚本失败标记
@@ -213,6 +213,7 @@ def fetch_pipeline_feedback(
     failed_jobs = []
     coverage_from_job = None   # 从 x86_64_ut_coverage_check 日志提取的覆盖率
     coverage_threshold = None  # 从日志提取的阈值
+    ut_coverage_job_id = None  # x86_64_ut_coverage_check 的 job id（无论 success/failed 都记录）
     all_jobs_info = []  # 记录所有 job 用于诊断
     jobs = []
     for p in all_pipelines:
@@ -229,15 +230,15 @@ def fetch_pipeline_feedback(
                 break
 
         if matched_target is None:
-            # 非目标 job，但如果失败也记录（用于 pipeline 级别兜底诊断）
+            # 非目标 job：仅标记名字与状态，不拉日志、不参与失败判定
             if job.status == "failed":
                 failed_jobs.append({
                     "name": job.name,
                     "status": job.status,
-                    "log_tail": _get_job_log_tail(project, job.id, JOB_LOG_TAIL_LINES),
+                    "log_tail": "",
                     "is_target": False,
                 })
-                logger.info(f"[pipeline] 非目标 job 失败: {job.name} (id={job.id})")
+                logger.info(f"[pipeline] 非目标 job 失败 (仅标记，不参与判定): {job.name}")
             continue
 
         if job.status == "failed":
@@ -250,7 +251,10 @@ def fetch_pipeline_feedback(
                 "is_target": True,
             })
             logger.info(f"[pipeline] 目标 job 失败: {job.name} (id={job.id})")
+            if "x86_64_ut_coverage_check" in job_name_lower:
+                ut_coverage_job_id = job.id
         elif job.status == "success" and "x86_64_ut_coverage_check" in job_name_lower:
+            ut_coverage_job_id = job.id
             # job 成功时从日志提取覆盖率数据
             cov_info = _extract_coverage_from_job(project, job.id)
             if cov_info:
@@ -288,6 +292,7 @@ def fetch_pipeline_feedback(
         "pipeline_status": pipeline.status,
         "coverage": final_coverage,
         "coverage_threshold": coverage_threshold,
+        "ut_coverage_job_id": ut_coverage_job_id,
         "failed_jobs": failed_jobs,
         "message": message,
     }
@@ -440,7 +445,7 @@ def _build_summary(pipeline, coverage: Optional[float], failed_jobs: list[dict])
             for fj in target_failed:
                 parts.append(f"  - {fj['name']}: {fj['status']}")
         if non_target_failed:
-            parts.append(f"其他 job 失败 ({len(non_target_failed)}):")
+            parts.append(f"非目标 job 失败 ({len(non_target_failed)}, 仅标记不参与判定):")
             for fj in non_target_failed:
                 parts.append(f"  - {fj['name']}: {fj['status']}")
     elif pipeline.status == "failed":

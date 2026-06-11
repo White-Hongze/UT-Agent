@@ -1,7 +1,7 @@
 [llm]
 model = "anthropic/claude-opus-4-2025-04-16"
-api_key = "xxxxxxx"
-base_url = "xxxxxxx"
+api_key = "sk-OU7kFD9mhK90OCUNwvVeMuOoet9QrRc7crSLtuiIxu4Su177"
+base_url = "https://cc.580ai.net"
 temperature = 0.2
 
 [agent]

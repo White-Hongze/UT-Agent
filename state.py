@@ -62,5 +62,7 @@ class UTAgentState(TypedDict):
     verification_verdict: Optional[str]  # Verifier 输出 JSON (PASS/FAIL + 详情)
     fix_plan: Optional[str]          # Planner 修复计划 JSON
     fix_iterations: int              # 修复迭代次数
+    fix_history: Optional[str]       # 修复历史 JSON: [{plan: ..., result: "FAIL"/"PASS", evidence: ...}, ...]
+    fix_patches: Optional[list[str]] # 修复模式产生的 patch 文件列表（与正常流程的 generated_patches 隔离）
     # 输出
     response: Optional[str]

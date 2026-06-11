@@ -16,6 +16,7 @@ from ut_agent.tools.context import ToolContext
 from ut_agent.tools.clone_branch import clone_source_branch
 from ut_agent.tools.commit_push import commit_and_push
 from ut_agent.tools.fetch_pipeline import fetch_pipeline_feedback
+from ut_agent.tools.fetch_coverage_report import fetch_changed_lines_report
 from ut_agent.prompt import load_prompt
 from ut_agent.llm import call_llm, call_llm_with_continuation
 from ut_agent.config import TEST_MODE as _CFG_TEST_MODE
@@ -108,7 +109,7 @@ _file_handler.setFormatter(logging.Formatter(
     "%(asctime)s | %(levelname)-7s | %(name)s | %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
 ))
 
-if not logger.handlers:
+if not logger.handlers: 
     logger.addHandler(_console_handler)
     logger.addHandler(_file_handler)
 
@@ -122,6 +123,21 @@ MIN_COVERAGE_THRESHOLD = 80.0   # 覆盖率合格线 (%)
 # 测试模式：跳过 LLM 环节，直接生成 dummy 文件测试推送链路
 # 优先读取环境变量，其次读取 settings.toml 中 [agent].test_mode
 TEST_MODE = os.environ.get("UT_AGENT_TEST_MODE", "0") == "1" or _CFG_TEST_MODE
+
+# 测试文件识别指标（用于从 diff 中排除测试文件）
+_TEST_INDICATORS = {"test_", "_test.", "_test_", "tests/", "test/"}
+_TEST_EXTENSIONS = {".cpp", ".cc", ".cxx", ".h", ".hpp", ".py"}
+
+
+def _is_test_file(filename: str) -> bool:
+    """判断文件是否为测试文件（不为其生成 UT）。"""
+    if not filename:
+        return False
+    ext = os.path.splitext(filename)[1].lower()
+    if ext not in _TEST_EXTENSIONS:
+        return False
+    path_lower = filename.replace("\\", "/").lower()
+    return any(ind.lower() in path_lower for ind in _TEST_INDICATORS)
 
 
 def collect_mr_info(state: UTAgentState) -> dict:
@@ -201,6 +217,19 @@ def _build_diff_content(diff_files: list[dict]) -> str:
     return "\n\n".join(sections) if sections else "无 diff 内容。"
 
 
+def _build_existing_test_context(test_files: list[dict]) -> str:
+    """将 MR 中已有的测试文件 diff 构建为上下文，帮助 LLM 识别已覆盖的代码。"""
+    if not test_files:
+        return ""
+    sections = []
+    for f in test_files:
+        filename = f["filename"]
+        patch = f.get("patch", "")
+        section = f"- `{filename}`:\n```diff\n{patch}\n```"
+        sections.append(section)
+    return "\n\n".join(sections)
+
+
 def _build_file_list(diff_files: list[dict]) -> str:
     """构建文件列表摘要。"""
     lines = []
@@ -212,10 +241,16 @@ def _build_file_list(diff_files: list[dict]) -> str:
     return "\n".join(lines) if lines else "无文件变更。"
 
 
-async def _analyze_batch(batch: list[dict], state: UTAgentState) -> str:
+async def _analyze_batch(batch: list[dict], state: UTAgentState, test_files: list[dict] | None = None) -> str:
     """对一批 diff_files 调用 LLM 分析，返回 JSON 字符串。"""
     system_prompt = load_prompt("analyze_diff_system")
     user_template = load_prompt("analyze_diff_user")
+
+    # 构建已有测试文件上下文（帮助 LLM 识别哪些代码已被覆盖）
+    if test_files:
+        test_context = _build_existing_test_context(test_files)
+    else:
+        test_context = ""
 
     user_prompt = user_template.format(
         title=state["title"],
@@ -226,6 +261,7 @@ async def _analyze_batch(batch: list[dict], state: UTAgentState) -> str:
         file_count=len(batch),
         file_list=_build_file_list(batch),
         diff_content=_build_diff_content(batch),
+        existing_test_context=test_context,
     )
 
     return await call_llm(system=system_prompt, user=user_prompt)
@@ -248,12 +284,19 @@ async def analyze_diff(state: UTAgentState) -> dict:
     if len(diff_files) < len(all_diff_files):
         skipped = len(all_diff_files) - len(diff_files)
         logger.info(f"[UT Agent] 跳过 {skipped} 个已删除文件，不进行 UT 分析")
+    # 过滤掉测试文件本身，测试文件不需要再为其生成 UT（但保留作为覆盖率上下文）
+    before_test_filter = len(diff_files)
+    test_files_in_diff = [f for f in diff_files if _is_test_file(f.get("filename", ""))]
+    diff_files = [f for f in diff_files if not _is_test_file(f.get("filename", ""))]
+    if len(diff_files) < before_test_filter:
+        skipped_tests = before_test_filter - len(diff_files)
+        logger.info(f"[UT Agent] 跳过 {skipped_tests} 个测试文件，不进行 UT 分析（作为已覆盖上下文保留）")
     mr_id = state["mr_id"]
     logger.info(f"[UT Agent] 文件数: {len(diff_files)} | 批次大小: {BATCH_SIZE}")
 
     if len(diff_files) <= BATCH_SIZE:
         logger.info(f"[UT Agent] 单批次模式，直接调用 LLM")
-        result = await _analyze_batch(diff_files, state)
+        result = await _analyze_batch(diff_files, state, test_files=test_files_in_diff)
         logger.info(f"[UT Agent] LLM 分析完成，结果长度: {len(result)} chars")
         _publish_analysis_comment(result, mr_id, len(diff_files))
         logger.info(f"[UT Agent] 评论已发布到 MR")
@@ -277,7 +320,7 @@ async def analyze_diff(state: UTAgentState) -> dict:
             batch = diff_files[i:i + BATCH_SIZE]
             batch_idx = i // BATCH_SIZE + 1
             logger.info(f"[UT Agent] 处理批次 {batch_idx}/{total_batches} ({len(batch)} 个文件)")
-            result = await _analyze_batch(batch, state)
+            result = await _analyze_batch(batch, state, test_files=test_files_in_diff)
             logger.info(f"[UT Agent] 批次 {batch_idx} LLM 完成，结果长度: {len(result)} chars")
             all_results.append(result)
 
@@ -303,6 +346,37 @@ async def analyze_diff(state: UTAgentState) -> dict:
         }
         logger.info(f"[UT Agent] State更新: task={state_update['task']}, action={state_update['current_action']}")
         return state_update
+
+
+def _extract_json_from_llm_output(text: str) -> str:
+    """
+    从 LLM 输出中鲁棒地提取 JSON 字符串，应对以下情况：
+    - 纯 JSON
+    - ```json ... ``` 围栏（含或不含语言标记）
+    - 围栏前后带有解释性文字（如"由于内容较长，我将..."前缀）
+    - 多段 ``` 围栏，取第一段
+    """
+    if not text:
+        return ""
+    s = text.strip()
+    # 1) 优先尝试提取 ``` 围栏内的内容
+    fence_start = s.find("```")
+    if fence_start != -1:
+        # 跳过 ```json 这一行
+        nl = s.find("\n", fence_start)
+        if nl != -1:
+            after_open = s[nl + 1:]
+            fence_end = after_open.find("```")
+            if fence_end != -1:
+                return after_open[:fence_end].strip()
+            # 没有结束围栏，返回开围栏之后的全部
+            return after_open.strip()
+    # 2) 退化方案：取第一个 { 到最后一个 } 之间的内容
+    first = s.find("{")
+    last = s.rfind("}")
+    if first != -1 and last != -1 and last > first:
+        return s[first:last + 1].strip()
+    return s
 
 
 def _repair_truncated_plan_json(json_str: str) -> str:
@@ -493,14 +567,10 @@ async def generate_test_plan(state: UTAgentState) -> dict:
     )
     logger.info(f"[UT Agent] 测试计划生成完成，长度: {len(result)} chars")
 
-    # 清理 markdown 代码围栏
-    cleaned_result = result.strip()
-    if cleaned_result.startswith("```"):
-        first_newline = cleaned_result.find("\n")
-        if first_newline != -1:
-            cleaned_result = cleaned_result[first_newline + 1:]
-        if cleaned_result.rstrip().endswith("```"):
-            cleaned_result = cleaned_result.rstrip()[:-3].rstrip()
+    # 提取 JSON（容忍 LLM 返回的前缀说明/markdown 围栏）
+    cleaned_result = _extract_json_from_llm_output(result)
+    if cleaned_result != result.strip():
+        logger.info(f"[UT Agent] 从 LLM 输出提取 JSON: 原始 {len(result)} chars → 提取后 {len(cleaned_result)} chars")
 
     # 校验 JSON 完整性，如果不完整则尝试修复
     try:
@@ -551,8 +621,14 @@ COPILOT_TIMEOUT = 600  # 10 分钟超时
 PROTECTED_FILE_PATTERNS = ["CMakeLists.txt", "*.cmake"]
 
 
-def _restore_protected_files(repo_dir: str) -> list[str]:
+def _restore_protected_files(
+    repo_dir: str,
+    original_mtimes: dict[str, float] | None = None,
+) -> list[str]:
     """检查被 Copilot 修改的 CMakeLists.txt，如果引用了不存在的源文件则恢复原版。
+
+    回滚后会同步把文件 mtime 恢复为 ``original_mtimes`` 里记录的原值，避免下游
+    基于 mtime 的快照差异把被回滚的文件误判为新生成内容。
 
     返回被拦截的错误描述列表（空列表表示全部通过）。
     """
@@ -578,10 +654,20 @@ def _restore_protected_files(repo_dir: str) -> list[str]:
             if not os.path.isfile(full_path):
                 continue
             cmake_dir = os.path.dirname(full_path)
-            with open(full_path, "r", encoding="utf-8", errors="ignore") as f:
-                content = f.read()
-            # 匹配 .cpp/.cc/.cxx/.c 文件引用
-            source_refs = re.findall(r'[\s(]([^\s()]*\.(?:cpp|cc|cxx|c))\b', content)
+            # 只检查 Copilot 本次新增的行（git diff 的 + 行），避免把 HEAD 里
+            # 本就存在的历史引用（可能是条件块/注释/glob 导致的死引用）算到本次头上，
+            # 否则会反复冤枉 Copilot 并把它正确的改动一起回滚。
+            diff_result = subprocess.run(
+                ["git", "diff", "--unified=0", "HEAD", "--", fpath],
+                cwd=repo_dir, capture_output=True, text=True, timeout=10
+            )
+            added_lines = [
+                ln[1:] for ln in diff_result.stdout.splitlines()
+                if ln.startswith("+") and not ln.startswith("+++")
+            ]
+            added_text = "\n".join(added_lines)
+            # 匹配 .cpp/.cc/.cxx/.c 文件引用（仅在新增行中）
+            source_refs = re.findall(r'[\s(]([^\s()]*\.(?:cpp|cc|cxx|c))\b', added_text)
             has_missing = False
             missing_files = []
             for src in source_refs:
@@ -597,12 +683,102 @@ def _restore_protected_files(repo_dir: str) -> list[str]:
                     ["git", "checkout", "--", fpath],
                     cwd=repo_dir, capture_output=True, timeout=10
                 )
+                # 恢复 mtime，避免下游 mtime-based diff 把被回滚的文件误判为新生成内容
+                if original_mtimes is not None and os.path.isfile(full_path):
+                    old_mtime = original_mtimes.get(full_path)
+                    if old_mtime is not None:
+                        try:
+                            os.utime(full_path, (old_mtime, old_mtime))
+                        except OSError as e:
+                            logger.debug(f"[UT Agent] 恢复 mtime 失败 {fpath}: {e}")
                 violations.append(violation_msg)
             else:
                 logger.info(f"[UT Agent] CMakeLists.txt 修改通过验证，保留: {fpath}")
     except Exception as e:
         logger.warning(f"[UT Agent] 检查 CMakeLists.txt 时出错: {e}")
     return violations
+
+
+def _build_safety_retry_message(
+    repo_dir: str,
+    violation_history: list[list[str]],
+    retry_count: int,
+    max_retries: int,
+) -> str:
+    """构造安全网拦截后给 Copilot 的重试提示。
+
+    包含历史违规记录、被回滚的 CMakeLists.txt 当前内容、所在目录的真实文件清单，
+    以及给 Copilot 的硬性规则，帮助它避免再次引用不存在的源文件。
+    """
+    import re as _re
+    affected_paths: set[str] = set()
+    for round_violations in violation_history:
+        for v in round_violations:
+            m = _re.match(r"^(.+?CMakeLists\.txt)\s+引用了", v)
+            if m:
+                affected_paths.add(m.group(1))
+
+    lines: list[str] = [
+        f"## ⚠️ 上次修改被回滚（第 {retry_count}/{max_retries} 次重试）",
+        "",
+        "你之前修改的 CMakeLists.txt 引用了仓库中**不存在**的源文件，"
+        "已被自动 `git checkout --` 回滚到 HEAD 版本。",
+        "",
+        "### 历史违规记录",
+    ]
+    for i, round_violations in enumerate(violation_history, 1):
+        lines.append(f"- 第 {i} 次:")
+        for v in round_violations:
+            lines.append(f"  - {v}")
+    lines.append("")
+
+    for fpath in sorted(affected_paths):
+        full_path = os.path.join(repo_dir, fpath)
+        cmake_dir = os.path.dirname(full_path)
+        try:
+            with open(full_path, "r", encoding="utf-8", errors="ignore") as f:
+                current_content = f.read().rstrip()
+        except OSError:
+            current_content = "(读取失败)"
+        lines.extend([
+            f"### {fpath}（当前内容，已恢复为 HEAD 版本）",
+            "```cmake",
+            current_content,
+            "```",
+            "",
+            f"### `{os.path.dirname(fpath) or '.'}` 目录下的真实文件清单",
+            "（**只能引用以下文件**，未列出的都不存在）",
+            "```",
+        ])
+        try:
+            for root, dirs, files in os.walk(cmake_dir):
+                rel_root = os.path.relpath(root, cmake_dir)
+                if rel_root != "." and rel_root.count(os.sep) >= 3:
+                    dirs[:] = []
+                    continue
+                dirs[:] = [
+                    d for d in dirs
+                    if d not in {".git", "build", "install", "log", ".vscode", "__pycache__"}
+                ]
+                for fn in sorted(files):
+                    rel = os.path.normpath(os.path.join(rel_root, fn)).replace("\\", "/")
+                    if rel.startswith("./"):
+                        rel = rel[2:]
+                    lines.append(rel)
+        except OSError as e:
+            lines.append(f"(列目录失败: {e})")
+        lines.extend(["```", ""])
+
+    lines.extend([
+        "### 必须遵守的规则",
+        "1. 修改 CMakeLists 前，先核对你要引用的每个源文件**真的出现在上面的清单中**",
+        "2. 只引用清单里实际存在的文件，不要根据计划/命名习惯臆造文件路径",
+        "3. 计划中的某个测试如果对应的源文件不存在，**跳过该测试**，不要伪造引用",
+        "4. 直接写相对路径，不要使用 `${CMAKE_CURRENT_SOURCE_DIR}/...` 之类的变量"
+        "（安全网按字面匹配，不展开变量）",
+        "5. 不要修改业务源码，不要执行 git 提交/推送，不要运行测试",
+    ])
+    return "\n".join(lines)
 
 
 def _build_copilot_prompt(test_plan: str, pending_cases: str | None, repo_dir: str, mr_id: int, iteration: int, languages: set[str] | None = None, fix_plan: str | None = None) -> str:
@@ -795,64 +971,79 @@ def _run_copilot_generate(
         return []
 
     # 安全网：恢复被 Copilot 意外修改的构建配置文件
-    violations = _restore_protected_files(repo_dir)
+    violations = _restore_protected_files(repo_dir, original_mtimes=before_files)
 
-    # 如果安全网拦截了 CMakeLists.txt 修改，带错误信息重试一次
-    if violations and not hasattr(_run_copilot_generate, "_in_retry"):
-        _run_copilot_generate._in_retry = True
-        try:
-            retry_msg = (
-                "你上一次修改的 CMakeLists.txt 被回滚了，因为引用了不存在的源文件。\n"
-                "具体错误:\n" + "\n".join(f"- {v}" for v in violations) + "\n\n"
-                "请重新修改，确保 CMakeLists.txt 中引用的每个源文件都实际存在于仓库中。\n"
-                "如果文件不存在，不要引用它。只引用你能在仓库中搜索到的文件。"
+    # 安全网拦截后带详细反馈重试 Copilot（最多 MAX_SAFETY_RETRIES 次）
+    MAX_SAFETY_RETRIES = 3
+    violation_history: list[list[str]] = []
+    if violations:
+        violation_history.append(violations)
+    safety_retry = 0
+    while violations and safety_retry < MAX_SAFETY_RETRIES:
+        safety_retry += 1
+        retry_msg = _build_safety_retry_message(
+            repo_dir, violation_history, safety_retry, MAX_SAFETY_RETRIES
+        )
+        logger.info(
+            f"[UT Agent] 安全网拦截，第 {safety_retry}/{MAX_SAFETY_RETRIES} 次带错误反馈重试 Copilot CLI..."
+        )
+        retry_prompt = prompt + f"\n\n---\n\n{retry_msg}"
+        # 重新记录快照（用于本轮 mtime 恢复）
+        before_files = _snapshot_test_files(repo_dir)
+        retry_cmd = [
+            "copilot",
+            "-p", retry_prompt,
+            "--allow-all-tools",
+            "--deny-tool=shell(git push)",
+            "--deny-tool=shell(git commit)",
+            "--deny-tool=shell(rm)",
+        ]
+        proc = subprocess.Popen(
+            retry_cmd,
+            cwd=repo_dir,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        stdout_lines = []
+        start_time = _time.time()
+        elapsed = 0.0
+        while True:
+            elapsed = _time.time() - start_time
+            if elapsed > COPILOT_TIMEOUT:
+                proc.kill()
+                logger.error(
+                    f"[UT Agent] 第 {safety_retry} 次重试 Copilot CLI 超时 ({int(elapsed)}s)"
+                )
+                break
+            line = proc.stdout.readline()
+            if line:
+                stripped = line.rstrip()
+                stdout_lines.append(stripped)
+                if stripped and len(stripped) < 500:
+                    logger.info(f"[Copilot-retry-{safety_retry}] {stripped}")
+            elif proc.poll() is not None:
+                remaining = proc.stdout.read()
+                if remaining:
+                    stdout_lines.extend(remaining.rstrip().split("\n"))
+                break
+        returncode = proc.returncode
+        logger.info(
+            f"[UT Agent] 第 {safety_retry} 次重试 Copilot CLI 退出码: {returncode} (耗时 {int(elapsed)}s)"
+        )
+        # 重试后再过一次安全网（仍传 before_files 以便对未通过的回滚也恢复 mtime）
+        violations = _restore_protected_files(repo_dir, original_mtimes=before_files)
+        if violations:
+            violation_history.append(violations)
+            logger.warning(
+                f"[UT Agent] 第 {safety_retry} 次重试后仍有安全网违规: {violations}"
             )
-            logger.info(f"[UT Agent] 安全网拦截，带错误反馈重试 Copilot CLI...")
-            retry_prompt = prompt + f"\n\n---\n\n## ⚠️ 上次修改被回滚\n\n{retry_msg}"
-            # 重新记录快照
-            before_files = _snapshot_test_files(repo_dir)
-            retry_cmd = [
-                "copilot",
-                "-p", retry_prompt,
-                "--allow-all-tools",
-                "--deny-tool=shell(git push)",
-                "--deny-tool=shell(git commit)",
-                "--deny-tool=shell(rm)",
-            ]
-            proc = subprocess.Popen(
-                retry_cmd,
-                cwd=repo_dir,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-            )
-            stdout_lines = []
-            start_time = _time.time()
-            while True:
-                elapsed = _time.time() - start_time
-                if elapsed > COPILOT_TIMEOUT:
-                    proc.kill()
-                    logger.error(f"[UT Agent] 重试 Copilot CLI 超时 ({int(elapsed)}s)")
-                    break
-                line = proc.stdout.readline()
-                if line:
-                    stripped = line.rstrip()
-                    stdout_lines.append(stripped)
-                    if stripped and len(stripped) < 500:
-                        logger.info(f"[Copilot-retry] {stripped}")
-                elif proc.poll() is not None:
-                    remaining = proc.stdout.read()
-                    if remaining:
-                        stdout_lines.extend(remaining.rstrip().split("\n"))
-                    break
-            returncode = proc.returncode
-            logger.info(f"[UT Agent] 重试 Copilot CLI 退出码: {returncode} (耗时 {int(elapsed)}s)")
-            # 重试后再过一次安全网
-            retry_violations = _restore_protected_files(repo_dir)
-            if retry_violations:
-                logger.warning(f"[UT Agent] 重试后仍有安全网违规: {retry_violations}")
-        finally:
-            del _run_copilot_generate._in_retry
+        else:
+            logger.info(f"[UT Agent] 第 {safety_retry} 次重试通过安全网检查")
+    if violations:
+        logger.warning(
+            f"[UT Agent] 安全网重试 {MAX_SAFETY_RETRIES} 次后仍未通过，违规历史: {violation_history}"
+        )
 
     # 对比文件快照，找出新增/修改的测试文件
     after_files = _snapshot_test_files(repo_dir)
@@ -936,7 +1127,8 @@ async def generate_patch(state: UTAgentState) -> dict:
         with open(dummy_file, "w", encoding="utf-8") as f:
             f.write('''#include <iostream>\n#include <gtest/gtest.h>\n\nTEST(UTAgentSmokeTest, HelloWorld) {\n    std::string msg = "hello world";\n    EXPECT_FALSE(msg.empty());\n    EXPECT_EQ(msg, "hello world");\n    std::cout << msg << std::endl;\n}\n\nint main(int argc, char **argv) {\n    ::testing::InitGoogleTest(&argc, argv);\n    return RUN_ALL_TESTS();\n}\n''')
         logger.info(f"[UT Agent] [TEST_MODE] 已生成: {dummy_file}")
-        generated_patches = [dummy_file]
+        generated_patches = list(dict.fromkeys((state.get("generated_patches") or []) + [dummy_file]))
+        fix_patches = list(state.get("fix_patches") or [])
     else:
         if pending_cases:
             logger.info(f"[UT Agent] 第{iteration}次迭代，处理未完成用例差异清单")
@@ -957,11 +1149,14 @@ async def generate_patch(state: UTAgentState) -> dict:
         # 如果是首次生成且有分片，逐片调用 Copilot（追加模式）
         output_dir = ToolContext.output_dir
         plan_parts_dir = os.path.join(output_dir, f"mr_{mr_id}", "plan_parts")
-        generated_patches = []
+        # fix 模式与正常生成模式各自独立维护清单，互不污染
+        previous_patches = list(state.get("generated_patches") or [])
+        previous_fix_patches = list(state.get("fix_patches") or [])
+        new_patches: list[str] = []
 
         if fix_plan:
-            # 修复模式：直接使用 fix_plan 调用 Copilot
-            generated_patches = _run_copilot_generate(
+            # 修复模式：独立清单，仅累计 fix_patches，不影响测试计划完成度
+            new_patches = _run_copilot_generate(
                 repo_dir=repo_dir,
                 test_plan=state.get("test_plan", ""),
                 pending_cases=None,
@@ -990,11 +1185,11 @@ async def generate_patch(state: UTAgentState) -> dict:
                         iteration=iteration,
                         languages=languages or None,
                     )
-                    generated_patches.extend(new_files)
-                    logger.info(f"[UT Agent] 分片 {idx} 完成: 生成 {len(new_files)} 个文件，累计 {len(generated_patches)} 个")
+                    new_patches.extend(new_files)
+                    logger.info(f"[UT Agent] 分片 {idx} 完成: 生成 {len(new_files)} 个文件，本轮累计 {len(new_patches)} 个")
             else:
                 # 无分片文件，回退到整体模式
-                generated_patches = _run_copilot_generate(
+                new_patches = _run_copilot_generate(
                     repo_dir=repo_dir,
                     test_plan=state.get("test_plan", ""),
                     pending_cases=pending_cases,
@@ -1004,7 +1199,7 @@ async def generate_patch(state: UTAgentState) -> dict:
                 )
         else:
             # pending_cases 模式或无分片目录
-            generated_patches = _run_copilot_generate(
+            new_patches = _run_copilot_generate(
                 repo_dir=repo_dir,
                 test_plan=state.get("test_plan", ""),
                 pending_cases=pending_cases,
@@ -1013,15 +1208,30 @@ async def generate_patch(state: UTAgentState) -> dict:
                 languages=languages or None,
             )
 
-        # 去重（同一个文件可能在多个分片中被追加修改）
-        generated_patches = list(dict.fromkeys(generated_patches))
+        # 与上轮累计文件合并去重，得到完整的已生成清单
+        if fix_plan:
+            # fix 模式：写到独立的 fix_patches，不动 generated_patches
+            fix_patches = list(dict.fromkeys(previous_fix_patches + new_patches))
+            generated_patches = previous_patches  # 保持不变
+            logger.info(f"[UT Agent] [FIX] 修复文件累计: {len(fix_patches)} 个（上轮 {len(previous_fix_patches)} + 本轮新增 {len(fix_patches) - len(previous_fix_patches)}）")
+        else:
+            fix_patches = previous_fix_patches  # 保持不变
+            generated_patches = list(dict.fromkeys(previous_patches + new_patches))
+            if previous_patches:
+                logger.info(f"[UT Agent] 累计文件: {len(generated_patches)} 个（上轮 {len(previous_patches)} + 本轮新增 {len(generated_patches) - len(previous_patches)}）")
 
     # 落盘 patch 文件列表到 JSON（解决 LangGraph state 传播不可靠问题）
     output_dir = ToolContext.output_dir
-    patches_manifest = os.path.join(output_dir, f"mr_{mr_id}", "generated_patches.json")
+    if fix_plan:
+        manifest_name = "fix_patches.json"
+        manifest_data = fix_patches
+    else:
+        manifest_name = "generated_patches.json"
+        manifest_data = generated_patches
+    patches_manifest = os.path.join(output_dir, f"mr_{mr_id}", manifest_name)
     os.makedirs(os.path.dirname(patches_manifest), exist_ok=True)
     with open(patches_manifest, "w", encoding="utf-8") as f:
-        json.dump(generated_patches, f, ensure_ascii=False)
+        json.dump(manifest_data, f, ensure_ascii=False)
     logger.info(f"[UT Agent] patch 清单已落盘: {patches_manifest}")
 
     state_update = {
@@ -1029,10 +1239,14 @@ async def generate_patch(state: UTAgentState) -> dict:
         "current_action": f"Patch 生成完成（第{iteration}次迭代）",
         "next_action": "校验计划完成度",
         "generated_patches": generated_patches,
+        "fix_patches": fix_patches,
         "patch_iterations": iteration,
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
-    logger.info(f"[UT Agent] State更新: iteration={iteration}, patches={len(generated_patches)}")
+    if fix_plan:
+        logger.info(f"[UT Agent] State更新: iteration={iteration}, fix_patches={len(fix_patches)}")
+    else:
+        logger.info(f"[UT Agent] State更新: iteration={iteration}, patches={len(generated_patches)}")
     return state_update
 
 
@@ -1075,6 +1289,24 @@ async def validate_plan(state: UTAgentState) -> dict:
     all_planned_cases = _extract_planned_cases(plan_content)
     logger.info(f"[UT Agent] 计划中共 {len(all_planned_cases)} 个测试用例")
 
+    # 1.5 分支预算交叉校验（A 方案：只 warn 不 fail，结果写入 validation 报告供 plan_fix 参考）
+    bb_all, bb_covered, bb_uncovered_declared = _extract_branch_budget_from_plan(plan_content)
+    bb_uncovered_declared_set = {x["branch"] for x in bb_uncovered_declared}
+    bb_missing = (bb_all - bb_covered) - bb_uncovered_declared_set if bb_all else set()
+    if bb_all:
+        logger.info(
+            f"[UT Agent] 分支预算: all={len(bb_all)} covered={len(bb_covered)} "
+            f"declared_uncovered={len(bb_uncovered_declared_set)} missing={len(bb_missing)}"
+        )
+        if bb_missing:
+            logger.warning(
+                f"[UT Agent] 计划存在未覆盖且未声明的分支 ({len(bb_missing)} 条): "
+                f"{sorted(bb_missing)[:10]}"
+                + ("..." if len(bb_missing) > 10 else "")
+            )
+    else:
+        logger.info("[UT Agent] 计划未提供 branch_coverage_check（旧格式或 LLM 未输出，跳过分支预算校验）")
+
     # 2. 读取已生成的 patch 文件，提取已实现的用例名
     generated_patches = state.get("generated_patches") or []
     completed_cases = _extract_completed_cases(generated_patches)
@@ -1083,13 +1315,22 @@ async def validate_plan(state: UTAgentState) -> dict:
     # 3. 计算差异：计划中有但 patch 中没有的 = pending
     pending_cases = [c for c in all_planned_cases if c["name"] not in completed_cases]
 
-    # 一致性校验：只判断「计划中的用例是否全部在 patch 中实现」
-    # 阈值/优先级类放宽逻辑放到 route_after_validate，避免污染 plan_valid 语义。
+    # 一致性校验：
+    # - 严格名字匹配通过 -> PASS
+    # - 名字对不上但实现数已 >= 计划数 -> PASS（LLM 自己起的测试名与计划名不一致，但量上已交付）
+    # - 计划/实现都为空 -> FAIL
     if len(all_planned_cases) == 0 and len(completed_cases) == 0:
         plan_valid = False
         logger.warning(f"[UT Agent] 计划为空且无 patch，判定为未通过")
+    elif len(pending_cases) == 0:
+        plan_valid = True
+    elif len(all_planned_cases) > 0 and len(completed_cases) >= len(all_planned_cases):
+        plan_valid = True
+        logger.info(
+            f"[UT Agent] 名字未严格匹配但实现数 ({len(completed_cases)}) >= 计划数 ({len(all_planned_cases)})，视为达标"
+        )
     else:
-        plan_valid = len(pending_cases) == 0
+        plan_valid = False
 
     # 4. 落盘本次校验结果
     validation_result = {
@@ -1100,6 +1341,12 @@ async def validate_plan(state: UTAgentState) -> dict:
         "all_completed": plan_valid,
         "completed_cases": list(completed_cases),
         "pending_cases": pending_cases,
+        "branch_budget": {
+            "total": len(bb_all),
+            "covered": len(bb_covered),
+            "declared_uncovered": sorted(bb_uncovered_declared_set),
+            "missing": sorted(bb_missing),
+        },
     }
     validation_path = os.path.join(mr_dir, f"validation_iter_{iteration}.json")
     os.makedirs(os.path.dirname(validation_path), exist_ok=True)
@@ -1124,16 +1371,8 @@ def _extract_planned_cases(plan_json_str: str) -> list[dict]:
     """从测试计划 JSON 中提取所有测试用例（name + priority + suite）。"""
     cases = []
 
-    # 清理 markdown 代码围栏（LLM 可能返回 ```json ... ```）
-    cleaned = plan_json_str.strip()
-    if cleaned.startswith("```"):
-        # 移除开头的 ```json 或 ```
-        first_newline = cleaned.find("\n")
-        if first_newline != -1:
-            cleaned = cleaned[first_newline + 1:]
-        # 移除结尾的 ```
-        if cleaned.rstrip().endswith("```"):
-            cleaned = cleaned.rstrip()[:-3].rstrip()
+    # 容忍 LLM 输出的前缀说明 + markdown 围栏
+    cleaned = _extract_json_from_llm_output(plan_json_str)
 
     try:
         plan = json.loads(cleaned)
@@ -1147,10 +1386,51 @@ def _extract_planned_cases(plan_json_str: str) -> list[dict]:
                         "priority": tc.get("priority", "P1"),
                         "description": tc.get("description", ""),
                         "assertions": tc.get("assertions", []),
+                        "covers_branches": tc.get("covers_branches", []) or [],
                     })
     except (json.JSONDecodeError, TypeError, AttributeError) as e:
         logger.warning(f"[UT Agent] 解析测试计划 JSON 失败: {e}")
     return cases
+
+
+def _extract_branch_budget_from_plan(plan_json_str: str) -> tuple[set[str], set[str], list[dict]]:
+    """从 plan 顶层 branch_coverage_check 中提取分支预算。
+
+    返回 (all_branches, covered_branches, uncovered_with_reason)。
+    每个元素都是 "B<id>.<edge>" 字符串。
+    """
+    all_set: set[str] = set()
+    covered_set: set[str] = set()
+    uncovered_list: list[dict] = []
+    cleaned = _extract_json_from_llm_output(plan_json_str)
+    try:
+        plan = json.loads(cleaned)
+    except (json.JSONDecodeError, TypeError, AttributeError):
+        return all_set, covered_set, uncovered_list
+
+    bcc = plan.get("branch_coverage_check") or {}
+    for x in bcc.get("all_branch_ids") or []:
+        if isinstance(x, str) and x:
+            all_set.add(x)
+    for x in bcc.get("covered") or []:
+        if isinstance(x, str) and x:
+            covered_set.add(x)
+    for item in bcc.get("uncovered") or []:
+        if isinstance(item, dict) and item.get("branch"):
+            uncovered_list.append({
+                "branch": item.get("branch"),
+                "reason": item.get("reason", ""),
+            })
+
+    # 兜底：如果 plan 没写 branch_coverage_check，从 test_cases.covers_branches 反推 covered
+    if not covered_set:
+        for tf in plan.get("test_files") or []:
+            for suite in tf.get("test_suites") or []:
+                for tc in suite.get("test_cases") or []:
+                    for b in tc.get("covers_branches") or []:
+                        if isinstance(b, str) and b:
+                            covered_set.add(b)
+    return all_set, covered_set, uncovered_list
 
 
 def _extract_completed_cases(patch_paths: list[str]) -> set[str]:
@@ -1234,14 +1514,17 @@ def upload_to_gitlab(state: UTAgentState) -> dict:
 
     # 优先从落盘的 JSON 清单读取 patch 列表（解决 state 传播不可靠问题）
     output_dir = ToolContext.output_dir
-    patches_manifest = os.path.join(output_dir, f"mr_{mr_id}", "generated_patches.json")
+    is_fix_mode = bool(state.get("fix_plan"))
+    manifest_name = "fix_patches.json" if is_fix_mode else "generated_patches.json"
+    state_field = "fix_patches" if is_fix_mode else "generated_patches"
+    patches_manifest = os.path.join(output_dir, f"mr_{mr_id}", manifest_name)
     if os.path.isfile(patches_manifest):
         with open(patches_manifest, "r", encoding="utf-8") as f:
             generated_patches = json.load(f)
-        logger.info(f"[UT Agent] 从清单文件加载 {len(generated_patches)} 个 patch")
+        logger.info(f"[UT Agent] 从清单文件加载 {len(generated_patches)} 个 patch ({manifest_name})")
     else:
-        generated_patches = state.get("generated_patches") or []
-        logger.info(f"[UT Agent] 从 state 加载 {len(generated_patches)} 个 patch")
+        generated_patches = state.get(state_field) or []
+        logger.info(f"[UT Agent] 从 state 加载 {len(generated_patches)} 个 patch ({state_field})")
 
     if not repo_dir:
         logger.error("[UT Agent] 无仓库路径，无法上传")
@@ -1422,6 +1705,7 @@ def verify_pipeline(state: UTAgentState) -> dict:
     pipeline_status = feedback.get("pipeline_status")
     coverage = feedback.get("coverage")
     coverage_threshold = feedback.get("coverage_threshold")  # 从 job 日志提取的阈值
+    ut_coverage_job_id = feedback.get("ut_coverage_job_id")  # x86_64_ut_coverage_check 的 job id
     failed_jobs = feedback.get("failed_jobs", [])
     fb_status = feedback.get("status")  # success / timeout / error
 
@@ -1434,39 +1718,20 @@ def verify_pipeline(state: UTAgentState) -> dict:
     non_target_failed = [fj for fj in failed_jobs if not fj.get("is_target", True) and fj.get("status") == "failed"]
     failed_job_names = [fj["name"] for fj in target_failed]
 
-    # 判定逻辑
-    # 0. pipeline 整体失败但目标 job 未报失败 → 仍然算 FAIL
+    # 非目标 job 失败仅作为诊断信息记录，不参与判定
+    if non_target_failed:
+        non_target_names = [fj["name"] for fj in non_target_failed]
+        logger.info(f"[UT Agent] Verifier: 非目标 job 失败 (仅标记不参与判定): {non_target_names}")
+
+    # 判定逻辑（仅看 build_release_arm64 / x86_64_ut_coverage_check 两个目标 job + 覆盖率）
+    # 0. 流水线整体失败但目标 job 均未失败 → 仍按覆盖率/目标 job 状态正常判定，不因非目标失败而 FAIL
     if pipeline_status == "failed" and not failed_job_names:
-        # 有非目标 job 失败
         if non_target_failed:
-            non_target_names = [fj["name"] for fj in non_target_failed]
-            log_snippets = []
-            for fj in non_target_failed[:3]:  # 最多取 3 个
-                snippet = (fj.get("log_tail") or "")[:1000]
-                log_snippets.append(f"{fj['name']}:\n{snippet}")
-            evidence.append(f"非目标 job 失败: {non_target_names}")
-            evidence.extend(log_snippets)
-            verdict = {
-                "result": "FAIL",
-                "failure_type": FAILURE_TYPE_BUILD,
-                "failure_reason": f"流水线失败，失败 job: {', '.join(non_target_names)}",
-                "evidence": evidence,
-                "failed_job_names": non_target_names,
-            }
+            logger.info(
+                f"[UT Agent] Verifier: pipeline failed 由非目标 job 引起，忽略并按目标 job 状态判定"
+            )
         else:
-            verdict = {
-                "result": "FAIL",
-                "failure_type": FAILURE_TYPE_UNKNOWN,
-                "failure_reason": f"流水线状态为 failed 但未找到具体失败 job",
-                "evidence": [feedback.get("message", "")],
-                "failed_job_names": [],
-            }
-        logger.info(f"[UT Agent] Verifier: FAIL (pipeline_failed, no target job matched)")
-        return {
-            "task": "verify_pipeline",
-            "verification_verdict": json.dumps(verdict, ensure_ascii=False),
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-        }
+            logger.warning(f"[UT Agent] Verifier: pipeline failed 但未匹配到任何 job 失败，按现有信息判定")
 
     # 1. 超时 -> FAIL (timeout)
     if fb_status == "timeout":
@@ -1532,11 +1797,62 @@ def verify_pipeline(state: UTAgentState) -> dict:
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
 
-    # 4. 流水线通过 — 还需校验覆盖率是否达标
-    if pipeline_status == "success":
+    # 4. 目标 job 均未失败 — 按覆盖率达标与否判定（pipeline_status 可能是 success，
+    #    也可能因非目标 job 失败而是 failed，但我们只关心两个目标 job + 覆盖率）
+    if not failed_job_names:
+        if non_target_failed:
+            evidence.append(
+                f"流水线整体 status={pipeline_status}，但仅非目标 job 失败 "
+                f"({[fj['name'] for fj in non_target_failed]})，已忽略"
+            )
         if coverage is not None:
             evidence.append(f"覆盖率: {coverage}%, 阈值: {threshold}%")
             if coverage < threshold:
+                # 拉取 changed_lines.html artifact，得到结构化的未覆盖行清单
+                if ut_coverage_job_id:
+                    logger.info(
+                        f"[UT Agent] 覆盖率不达标，拉取 changed_lines.html "
+                        f"(job #{ut_coverage_job_id}) 用于精准修复"
+                    )
+                    cov_report = fetch_changed_lines_report(ut_coverage_job_id)
+                    if cov_report.get("available"):
+                        evidence.append("=== 未覆盖行报告（来自 changed_lines.html） ===")
+                        evidence.append(cov_report.get("report_text") or "")
+                        # 落盘原始解析结果 + 原始 HTML 兜底（首次跑或解析为空时方便人工排查/校准）
+                        try:
+                            mr_id = state.get("mr_id")
+                            output_dir = ToolContext.output_dir
+                            mr_dir = os.path.join(output_dir, f"mr_{mr_id}")
+                            os.makedirs(mr_dir, exist_ok=True)
+                            iter_no = state.get("fix_iterations", 0)
+                            cov_dump_path = os.path.join(mr_dir, f"coverage_report_iter_{iter_no}.json")
+                            with open(cov_dump_path, "w", encoding="utf-8") as f:
+                                json.dump({
+                                    "summary": cov_report.get("summary"),
+                                    "files": cov_report.get("files"),
+                                    "color_stats": cov_report.get("color_stats"),
+                                }, f, ensure_ascii=False, indent=2)
+                            # 解析没抓到 uncovered 时，把 raw_html_compact 也落盘，便于校准启发式
+                            if not cov_report.get("files"):
+                                raw_dump = os.path.join(mr_dir, f"coverage_raw_iter_{iter_no}.html")
+                                with open(raw_dump, "w", encoding="utf-8") as f:
+                                    f.write(cov_report.get("raw_html_compact") or "")
+                                logger.warning(
+                                    f"[UT Agent] 解析未发现 uncovered 行，已落盘原始 HTML: {raw_dump}"
+                                )
+                                # 兜底：把压缩后的 HTML 直接喂给 LLM
+                                evidence.append("（解析器未识别出未覆盖行，附原始 HTML 供分析）")
+                                evidence.append(cov_report.get("raw_html_compact") or "")
+                            logger.info(f"[UT Agent] 未覆盖行报告已落盘: {cov_dump_path}")
+                        except Exception as _e:
+                            logger.warning(f"[UT Agent] 落盘 coverage report 失败: {_e}")
+                    else:
+                        reason = cov_report.get("reason", "未知")
+                        logger.warning(f"[UT Agent] 拉取 changed_lines.html 失败: {reason}")
+                        evidence.append(f"（未能拉取 changed_lines.html: {reason}）")
+                else:
+                    logger.warning("[UT Agent] 无 ut_coverage_job_id，跳过 changed_lines.html 拉取")
+
                 verdict = {
                     "result": "FAIL",
                     "failure_type": FAILURE_TYPE_COVERAGE,
@@ -1600,20 +1916,32 @@ def route_after_verify(state: UTAgentState) -> str:
     return "plan_fix"
 
 
+def route_after_plan_fix(state: UTAgentState) -> str:
+    """plan_fix 后路由: unfixable -> END, 否则 -> generate_patch。"""
+    fix_plan_raw = state.get("fix_plan")
+    if fix_plan_raw:
+        try:
+            fix_plan = json.loads(fix_plan_raw)
+            if fix_plan.get("unfixable"):
+                logger.warning(f"[UT Agent] 修复计划判定为不可修复: {fix_plan.get('unfixable_reason', '')}")
+                return END
+        except (json.JSONDecodeError, TypeError):
+            pass
+    return "generate_patch"
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Planner: 根据失败类型制定修复计划
 # ──────────────────────────────────────────────────────────────────────────────
 
-def plan_fix(state: UTAgentState) -> dict:
+async def plan_fix(state: UTAgentState) -> dict:
     """
     Planner 节点：根据 Verifier 的 FAIL 结论制定修复计划。
 
-    按 failure_type 分流：
-    - build_failure: 定位编译错误，修复源码/CMake 问题
-    - test_failure: 分析失败用例日志，修复测试代码
-    - coverage_insufficient: 生成补充测试用例
-    - pipeline_timeout: 报告超时，建议人工介入
-    - unknown: 输出诊断报告
+    使用 LLM 生成修复计划，注入：
+    - 原始测试目标（test_plan 摘要）
+    - 当前 CI 错误（evidence）
+    - 历史修复记录（plan + result），标注为失败以避免重复
     """
     logger.info(f"[UT Agent] === Task: plan_fix ===")
 
@@ -1625,52 +1953,97 @@ def plan_fix(state: UTAgentState) -> dict:
 
     logger.info(f"[UT Agent] Planner: failure_type={failure_type}, 迭代={fix_iters+1}/{MAX_FIX_ITERATIONS}")
 
-    # 构建修复任务描述（供 generate_patch 使用）
-    fix_task = {
-        "mode": "fix",  # 区别于初次生成的 "generate" 模式
+    # 构建历史修复记录文本
+    fix_history = json.loads(state.get("fix_history", "[]"))
+
+    # 将上一轮 PENDING 的记录标记为 FAIL（因为走到 plan_fix 说明上一轮失败了）
+    if fix_history and fix_history[-1].get("result") == "PENDING":
+        fix_history[-1]["result"] = "FAIL"
+        # 注入本次失败的 evidence 摘要
+        evidence_summary = "\n".join(evidence[:5]) if isinstance(evidence, list) else str(evidence)
+        fix_history[-1]["failure_evidence"] = evidence_summary[:1000]
+        logger.info(f"[UT Agent] 已标记第 {len(fix_history)} 轮修复为 FAIL")
+
+    if fix_history:
+        history_lines = []
+        for i, entry in enumerate(fix_history, 1):
+            history_lines.append(
+                f"### 第 {i} 轮修复（结果: {entry.get('result', 'FAIL')}）\n"
+                f"**诊断:** {entry.get('diagnosis', 'N/A')}\n"
+                f"**策略:** {entry.get('instructions', 'N/A')}\n"
+                f"**失败原因:** {entry.get('failure_evidence', 'N/A')}\n"
+            )
+        fix_history_section = "\n".join(history_lines)
+    else:
+        fix_history_section = "无历史修复记录（这是第一轮修复）。"
+
+    # 构建测试计划摘要（调用 LLM 总结）
+    test_plan_raw = state.get("test_plan", "")
+    if test_plan_raw:
+        try:
+            summary_result = await call_llm(
+                system="你是一名技术文档摘要助手。请将以下测试计划精炼为一段简洁的摘要（不超过 2000 字），保留关键测试目标、覆盖范围和核心约束。只输出摘要文本，不要额外解释。",
+                user=test_plan_raw,
+            )
+            test_plan_summary = summary_result.strip() if summary_result else test_plan_raw[:2000]
+        except Exception as e:
+            logger.warning(f"[UT Agent] 测试计划摘要 LLM 调用失败，回退截取: {e}")
+            test_plan_summary = test_plan_raw[:2000] + "..." if len(test_plan_raw) > 2000 else test_plan_raw
+    else:
+        test_plan_summary = "无测试计划摘要。"
+
+    # 构建 evidence 文本
+    evidence_text = "\n".join(evidence[:20]) if isinstance(evidence, list) else str(evidence)
+
+    # 调用 LLM 生成修复计划
+    system_prompt = load_prompt("plan_fix_system")
+    user_template = load_prompt("plan_fix_user")
+    user_prompt = user_template.format(
+        mr_id=state["mr_id"],
+        test_plan_summary=test_plan_summary,
+        failure_type=failure_type,
+        failure_reason=failure_reason,
+        iteration=fix_iters + 1,
+        max_iterations=MAX_FIX_ITERATIONS,
+        evidence=evidence_text,
+        fix_history_section=fix_history_section,
+    )
+
+    try:
+        llm_result = await call_llm(system=system_prompt, user=user_prompt)
+    except Exception as e:
+        logger.error(f"[UT Agent] LLM 调用失败，回退到模板模式: {e}")
+        llm_result = None
+
+    # 解析 LLM 输出
+    fix_task = None
+    if llm_result:
+        cleaned = _extract_json_from_llm_output(llm_result)
+        try:
+            fix_task = json.loads(cleaned)
+            logger.info(f"[UT Agent] LLM 生成修复计划成功: diagnosis={fix_task.get('diagnosis', '')}")
+        except json.JSONDecodeError as e:
+            logger.warning(f"[UT Agent] LLM 修复计划 JSON 解析失败: {e}")
+
+    # 回退到模板模式（如果 LLM 失败）
+    if not fix_task:
+        fix_task = _build_template_fix_plan(failure_type, failure_reason, evidence, fix_iters)
+
+    # 组装最终 fix_plan（供 generate_patch 使用）
+    fix_plan_output = {
+        "mode": "fix",
         "failure_type": failure_type,
         "failure_reason": failure_reason,
         "evidence": evidence,
         "iteration": fix_iters + 1,
+        "diagnosis": fix_task.get("diagnosis", failure_reason),
+        "root_cause": fix_task.get("root_cause", "other"),
+        "unfixable": fix_task.get("unfixable", False),
+        "unfixable_reason": fix_task.get("unfixable_reason"),
+        "fix_steps": fix_task.get("fix_steps", []),
+        "instructions": fix_task.get("instructions", ""),
+        "strategy_diff_from_previous": fix_task.get("strategy_diff_from_previous"),
     }
-
-    # 按类型生成具体指令
-    if failure_type == FAILURE_TYPE_BUILD:
-        fix_task["instructions"] = (
-            "编译失败修复:\n"
-            "1. 从 evidence 中的编译日志定位 error: 行\n"
-            "2. 检查是否是新增测试代码引入的问题(头文件缺失/类型错误/链接问题)\n"
-            "3. 修复测试代码中的编译错误，不要修改源码\n"
-            "4. 若需修改 CMakeLists.txt，只能修改测试相关 target，且引用的所有文件必须实际存在，禁止引用不存在的文件\n"
-            "5. 不允许修改已有的非测试 target（add_library/add_executable 的已有业务目标）"
-        )
-    elif failure_type == FAILURE_TYPE_TEST:
-        fix_task["instructions"] = (
-            "测试失败修复:\n"
-            "1. 从 evidence 中找到 [FAILED] 的测试用例名\n"
-            "2. 分析失败原因(assertion 不匹配/超时/异常)\n"
-            "3. 修复测试代码中的逻辑错误\n"
-            "4. 如果是 mock 不正确导致的，修正 mock 返回值或行为"
-        )
-    elif failure_type == FAILURE_TYPE_COVERAGE:
-        fix_task["instructions"] = (
-            "覆盖率不足补充:\n"
-            "1. 分析当前覆盖率与目标差距\n"
-            "2. 找到未覆盖的代码分支/路径\n"
-            "3. 补充测试用例覆盖缺失的分支\n"
-            "4. 优先覆盖错误处理路径和边界条件"
-        )
-    elif failure_type == FAILURE_TYPE_TIMEOUT:
-        fix_task["instructions"] = (
-            "流水线超时:\n"
-            "无法自动修复，生成诊断报告供人工审查。\n"
-            "可能原因: CI runner 负载/网络问题/死循环测试"
-        )
-    else:
-        fix_task["instructions"] = (
-            "未知错误:\n"
-            "生成诊断报告，记录所有可用证据供人工审查。"
-        )
 
     # 落盘修复计划
     output_dir = ToolContext.output_dir
@@ -1678,26 +2051,94 @@ def plan_fix(state: UTAgentState) -> dict:
     fix_plan_path = os.path.join(output_dir, f"mr_{mr_id}", f"fix_plan_iter{fix_iters+1}.json")
     os.makedirs(os.path.dirname(fix_plan_path), exist_ok=True)
     with open(fix_plan_path, "w", encoding="utf-8") as f:
-        json.dump(fix_task, f, ensure_ascii=False, indent=2)
+        json.dump(fix_plan_output, f, ensure_ascii=False, indent=2)
     logger.info(f"[UT Agent] 修复计划已落盘: {fix_plan_path}")
+
+    # 更新 fix_history：将本轮计划加入（result 待 verify_pipeline 填写）
+    new_history_entry = {
+        "iteration": fix_iters + 1,
+        "diagnosis": fix_plan_output.get("diagnosis", ""),
+        "instructions": fix_plan_output.get("instructions", ""),
+        "root_cause": fix_plan_output.get("root_cause", ""),
+        "unfixable": fix_plan_output.get("unfixable", False),
+        "result": "PENDING",  # 待 verify_pipeline 更新
+        "failure_evidence": None,
+    }
+    fix_history.append(new_history_entry)
 
     # 发布 MR 评论
     git_provider = ToolContext.git_provider
     if git_provider:
+        unfixable_note = ""
+        if fix_plan_output.get("unfixable"):
+            unfixable_note = f"\n\n⚠️ **判定为不可修复:** {fix_plan_output.get('unfixable_reason', '')}"
+        strategy_diff = ""
+        if fix_plan_output.get("strategy_diff_from_previous"):
+            strategy_diff = f"\n**策略变化:** {fix_plan_output['strategy_diff_from_previous']}"
         git_provider.publish_comment(
             f"## UT Agent - 修复计划 (第 {fix_iters+1} 轮) 🔧\n\n"
             f"**失败类型:** `{failure_type}`\n"
-            f"**原因:** {failure_reason}\n\n"
-            f"**修复策略:**\n```\n{fix_task['instructions']}\n```"
+            f"**诊断:** {fix_plan_output.get('diagnosis', failure_reason)}\n"
+            f"**根因:** `{fix_plan_output.get('root_cause', 'unknown')}`\n"
+            f"{strategy_diff}"
+            f"\n\n**修复策略:**\n```\n{fix_plan_output.get('instructions', '')}\n```"
+            f"{unfixable_note}"
         )
 
     return {
         "task": "plan_fix",
-        "fix_plan": json.dumps(fix_task, ensure_ascii=False),
+        "fix_plan": json.dumps(fix_plan_output, ensure_ascii=False),
         "fix_iterations": fix_iters + 1,
+        "fix_history": json.dumps(fix_history, ensure_ascii=False),
         "current_action": f"修复计划已生成: {failure_type}",
         "next_action": "generate_patch (修复模式)",
         "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def _build_template_fix_plan(failure_type: str, failure_reason: str, evidence: list, fix_iters: int) -> dict:
+    """LLM 调用失败时的模板回退方案。"""
+    if failure_type == FAILURE_TYPE_BUILD:
+        instructions = (
+            "编译失败修复:\n"
+            "1. 从 evidence 中的编译日志定位 error: 行\n"
+            "2. 检查是否是新增测试代码引入的问题(头文件缺失/类型错误/链接问题)\n"
+            "3. 修复测试代码中的编译错误，不要修改源码\n"
+            "4. 若需修改 CMakeLists.txt，只能修改测试相关 target，且引用的所有文件必须实际存在\n"
+            "5. 不允许修改已有的非测试 target"
+        )
+    elif failure_type == FAILURE_TYPE_TEST:
+        instructions = (
+            "测试失败修复:\n"
+            "1. 从 evidence 中找到 [FAILED] 的测试用例名\n"
+            "2. 分析失败原因(assertion 不匹配/超时/异常)\n"
+            "3. 修复测试代码中的逻辑错误\n"
+            "4. 如果是 mock 不正确导致的，修正 mock 返回值或行为"
+        )
+    elif failure_type == FAILURE_TYPE_COVERAGE:
+        instructions = (
+            "覆盖率不足补充:\n"
+            "1. 分析当前覆盖率与目标差距\n"
+            "2. 找到未覆盖的代码分支/路径\n"
+            "3. 补充测试用例覆盖缺失的分支\n"
+            "4. 优先覆盖错误处理路径和边界条件"
+        )
+    elif failure_type == FAILURE_TYPE_TIMEOUT:
+        instructions = (
+            "流水线超时:\n"
+            "无法自动修复，生成诊断报告供人工审查。"
+        )
+    else:
+        instructions = "未知错误:\n生成诊断报告，记录所有可用证据供人工审查。"
+
+    return {
+        "diagnosis": failure_reason,
+        "root_cause": "other",
+        "unfixable": False,
+        "unfixable_reason": None,
+        "fix_steps": [],
+        "instructions": instructions,
+        "strategy_diff_from_previous": None,
     }
 
 
@@ -1763,8 +2204,12 @@ def build_graph() -> CompiledStateGraph:
         route_after_verify,
         {END: END, "plan_fix": "plan_fix"},
     )
-    # plan_fix 之后回到 generate_patch 执行修复
-    workflow.add_edge("plan_fix", "generate_patch")
+    # plan_fix 之后：unfixable 则终止，否则继续修复
+    workflow.add_conditional_edges(
+        "plan_fix",
+        route_after_plan_fix,
+        {"generate_patch": "generate_patch", END: END},
+    )
 
     return workflow.compile()
 
@@ -1783,5 +2228,6 @@ class UTAgent:
         mr_info.setdefault("clone_attempts", 0)
         mr_info.setdefault("patch_iterations", 0)
         mr_info.setdefault("generated_patches", [])
+        mr_info.setdefault("fix_history", "[]")
         result = await self.graph.ainvoke(mr_info)
         return result.get("response", "ERROR: 工作流未生成响应")

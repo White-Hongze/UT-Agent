@@ -15,11 +15,32 @@
 - **Act**：执行被测函数
 - **Assert**：验证结果
 
-## 测试命名规范
+## 测试命名规范（强制锁死）
 
-格式：`test_函数名_场景_期望结果`
+**测试函数名必须与测试计划中 `test_cases[].name` 字段原样一致，不得改名、缩短、合并、拆分。** 这是后续 validate 阶段做"计划 vs 实现"对账的唯一锚点。
 
-例如：`test_add_positive_numbers_returns_sum`
+例如 plan 中写的是：
+```json
+{"name": "CheckAndReportFaults_WhenNotReady_ShouldClearAllFaults"}
+```
+
+C++ 必须输出：
+```cpp
+TEST_F(SuiteName, CheckAndReportFaults_WhenNotReady_ShouldClearAllFaults) { ... }
+```
+
+Python 必须输出：
+```python
+def test_CheckAndReportFaults_WhenNotReady_ShouldClearAllFaults(...):
+```
+（pytest 函数前缀 `test_` 之外，原样保留 plan 中的名字）
+
+**禁止**：
+- 改写为更短/更长的版本（如改为 `TestNotReadyClearsFaults`）
+- 把多个 plan 用例合并到一个 TEST 里
+- 把一个 plan 用例拆成多个 TEST
+
+如果你在写代码过程中发现 plan 漏了某个分支需要补充用例，新增的用例命名格式必须保持一致（`被测函数_场景_期望结果`，合法标识符），并以"补充用例"心态追加，不要替换或挤掉 plan 已有用例。
 
 ## 测试文件放置规则
 
@@ -48,6 +69,8 @@
 
 ## Mock 策略
 
+### 必须 mock 的（外部依赖）
+
 涉及第三方库中有副作用或不稳定行为的部分，**必须 mock 掉**：
 - 网络请求（HTTP、gRPC、socket）
 - 文件 IO（读写文件系统）
@@ -57,11 +80,41 @@
 - 时间相关（sleep、定时器、系统时钟）
 - 随机数生成
 
-以下**不需要 mock**：
+### 不需要 mock 的（标准纯函数）
+
 - 纯数学计算库（math、cmath、algorithm）
 - 字符串操作（string、regex）
 - 标准容器操作（vector、map、list）
 - 简单确定性的工具函数
+
+### 严禁 mock 的（被测对象本体 — Anti-Mock 红线）
+
+**这条是覆盖率达标的生命线，违反等于本次生成作废。**
+
+不允许 mock 的对象包括：
+- **被测函数本身** —— 测试必须真实调用它，否则覆盖率不会上涨
+- **被测函数所在的 class** —— 应通过构造真实对象 + 注入 mock 依赖来测，而不是把整个 class 替换为 mock
+- **同一 .cpp / .py 文件内被测函数调用的 private/static helper** —— 它们是被测代码的一部分，必须真实执行
+- 测试计划中 `do_not_mock` 数组列出的所有符号
+
+如果遇到 plan 中要求测试某个 class 的成员函数 X，不允许采用 `MockMyClass::X()` 这类方案。正确做法：
+
+```cpp
+// 错误 ❌：mock 掉了被测对象
+class MockFooManager : public FooManager { MOCK_METHOD(int, DoWork, ()); };
+
+// 正确 ✅：构造真实 FooManager，mock 它的外部依赖
+class FakeNetwork : public INetwork { ... };  // 只 mock 外部依赖
+TEST_F(FooManagerTest, DoWork_HappyPath_ReturnsZero) {
+    FakeNetwork fake_net;
+    FooManager mgr(&fake_net);     // 真实对象
+    EXPECT_EQ(mgr.DoWork(), 0);    // 真实调用
+}
+```
+
+### 校验心法
+
+写完一个 TEST 后自检："如果我把被测函数的 body 全删掉只留 `return 0;`，这个测试还会通过吗？" 如果会，说明这个测试根本没真的测被测代码（很可能 mock 过头了），必须重写。
 
 ## 私有函数测试约束
 
